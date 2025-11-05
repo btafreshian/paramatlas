@@ -1,36 +1,5 @@
 #!/usr/bin/env python3
-"""
-audit_vllm_cluster.py
----------------------
-All-in-one, zero-hyperparameter inspector for a model served via vLLM's
-OpenAI-compatible API OR a direct HF id. It can:
-
-1) Discover the model id from your endpoint (or accept --model to skip discovery).
-2) FAST mode (recommended for huge models): build the full module skeleton and
-   per-module param/buffer counts from config WITHOUT loading real weights
-   using accelerate.init_empty_weights (no VRAM moves, very quick).
-3) Full mode (optional): load the actual model with transformers (device_map='auto',
-   dtype auto), enumerate modules, and (optionally) attach one-shot hooks.
-
-Outputs (in ./reports/<timestamp>_<model_id>/):
-- endpoint.json        : endpoint + /v1/models payload (if endpoint used)
-- summary.txt          : human summary (+ integrity stamps & PASS/FAIL)
-- skeleton.txt         : indented module tree
-- modules.csv          : flat table with names/classes/counts + router/expert flags
-- routers.csv          : suspected routers
-- experts.csv          : suspected experts
-- validation_report.txt: MoE consistency & integrity details
-- hook_log.txt         : (full mode only) one-liners from tiny forward
-
-Usage:
-  # Auto-detect model via endpoint (zero knobs)
-  python audit_vllm_cluster.py --endpoint http://localhost:8000 --fast
-
-  # Direct HF id, no endpoint
-  python audit_vllm_cluster.py --model Qwen/Qwen3-VL-30B-A3B-Instruct --fast
-
-Deps: transformers, torch, requests, accelerate (FAST mode)
-"""
+"""Utility for auditing models served via vLLM or Hugging Face ids."""
 
 import argparse
 import contextlib
@@ -38,61 +7,134 @@ import csv
 import datetime as dt
 import io
 import json
+import logging
 import os
 import re
+import sys
 from dataclasses import dataclass
-from typing import Dict, List, Tuple
-
-import torch
-from torch import nn
+from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 import requests
-from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer, AutoModel
+import torch
+from torch import nn
+from transformers import AutoConfig, AutoModel, AutoModelForCausalLM, AutoTokenizer
 from transformers.utils import is_torch_bf16_gpu_available
 
 # accelerate is only needed for --fast
 try:
     from accelerate import init_empty_weights
+
     ACCEL_AVAILABLE = True
 except Exception:
     ACCEL_AVAILABLE = False
+
+
+logger = logging.getLogger("audit_vllm_cluster")
 
 
 # -----------------------------
 # CLI
 # -----------------------------
 
-def parse_args():
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--endpoint", default=os.environ.get("VLLM_ENDPOINT", "http://localhost:8000"),
-                    help="vLLM/OpenAI-compatible base URL (default: %(default)s)")
-    ap.add_argument("--model", default=None,
-                    help="Optional HF model id or local path to skip endpoint discovery (e.g., Qwen/Qwen3-VL-30B-A3B-Instruct)")
-    ap.add_argument("--no-hooks", action="store_true", help="Disable tiny one-shot hooks sanity check (full mode only)")
-    ap.add_argument("--fast", action="store_true", help="FAST: build skeleton & counts from config with empty weights (no real weight load)")
-    ap.add_argument("--outdir", default="reports", help="Directory to create report folder in")
-    return ap.parse_args()
+def parse_args() -> argparse.Namespace:
+    """Parse command-line arguments."""
+
+    parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "--endpoint",
+        default=os.environ.get("VLLM_ENDPOINT", "http://localhost:8000"),
+        help="vLLM/OpenAI-compatible base URL (default: %(default)s)",
+    )
+    parser.add_argument(
+        "--model",
+        default=None,
+        help=(
+            "Optional HF model id or local path to skip endpoint discovery "
+            "(e.g., Qwen/Qwen3-VL-30B-A3B-Instruct)"
+        ),
+    )
+    parser.add_argument(
+        "--no-hooks",
+        action="store_true",
+        help="Disable tiny one-shot hooks sanity check (full mode only)",
+    )
+    parser.add_argument(
+        "--mode",
+        choices=["fast", "full"],
+        default=None,
+        help="Select run mode explicitly: fast (empty weights) or full (load real weights)",
+    )
+    parser.add_argument(
+        "--fast",
+        action="store_true",
+        help="FAST: build skeleton & counts from config with empty weights (no real weight load)",
+    )
+    parser.add_argument(
+        "--outdir",
+        default="reports",
+        help="Directory to create report folder in",
+    )
+    parser.add_argument(
+        "--json-output",
+        action="store_true",
+        help="Also emit summary.json and modules.json alongside existing reports",
+    )
+    parser.add_argument(
+        "-v",
+        "--verbosity",
+        choices=["quiet", "normal", "verbose"],
+        default="normal",
+        help="Logging verbosity: quiet, normal, or verbose (default: normal)",
+    )
+    return parser.parse_args()
+
+
+def configure_logging(verbosity: str) -> None:
+    """Configure logging according to verbosity level."""
+
+    verbosity_levels = {
+        "quiet": logging.WARNING,
+        "normal": logging.INFO,
+        "verbose": logging.DEBUG,
+    }
+    log_level = verbosity_levels.get(verbosity, logging.INFO)
+    logging.basicConfig(level=log_level, format="%(message)s")
+    logger.setLevel(log_level)
+
+
+def resolve_fast_mode(args: argparse.Namespace) -> bool:
+    """Resolve whether FAST mode should be used."""
+
+    if args.mode == "fast":
+        return True
+    if args.mode == "full":
+        return False
+    return bool(args.fast)
 
 
 # -----------------------------
 # Endpoint helpers
 # -----------------------------
 
-def get_models_from_endpoint(base_url: str) -> dict:
-    url = base_url.rstrip("/") + "/v1/models"
-    r = requests.get(url, timeout=10)
-    r.raise_for_status()
-    return r.json()
+def get_models_from_endpoint(base_url: str) -> Dict[str, Any]:
+    """Query `/v1/models` from the provided endpoint."""
 
-def pick_model_id(models_payload: dict) -> str:
+    url = base_url.rstrip("/") + "/v1/models"
+    response = requests.get(url, timeout=10)
+    response.raise_for_status()
+    return response.json()
+
+
+def pick_model_id(models_payload: Dict[str, Any]) -> str:
+    """Select the first non-embedding model id from an endpoint payload."""
+
     data = models_payload.get("data", [])
     if not data:
         raise RuntimeError("Endpoint returned no models in /v1/models")
-    # Prefer the first non-embedding entry
-    for m in data:
-        mid = m.get("id", "")
-        if mid and "embed" not in mid.lower():
-            return mid
+    for model in data:
+        model_id = model.get("id", "")
+        if model_id and "embed" not in model_id.lower():
+            return model_id
     return data[0].get("id", "")
 
 
@@ -100,8 +142,11 @@ def pick_model_id(models_payload: dict) -> str:
 # MoE heuristics
 # -----------------------------
 
+
 @dataclass
 class Row:
+    """Flat representation of module metadata used for reporting."""
+
     name: str
     cls: str
     parent: str
@@ -113,37 +158,143 @@ class Row:
     is_expert: bool
     moe_group: str
 
+
+def write_modules_json(report_dir: str, rows: Iterable[Row]) -> None:
+    """Write modules.json mirroring modules.csv order and columns."""
+
+    modules_path = os.path.join(report_dir, "modules.json")
+    payload: List[Dict[str, Any]] = []
+    for row in rows:
+        payload.append(
+            {
+                "name": row.name,
+                "class": row.cls,
+                "parent": row.parent,
+                "depth": row.depth,
+                "n_params": row.n_params,
+                "n_trainable": row.n_trainable,
+                "n_buffers": row.n_buffers,
+                "is_router": bool(row.is_router),
+                "is_expert": bool(row.is_expert),
+                "moe_group": row.moe_group,
+            }
+        )
+    with open(modules_path, "w", encoding="utf-8") as fh:
+        json.dump(payload, fh, indent=2)
+
+
+def write_summary_json(
+    report_dir: str,
+    *,
+    model_id: str,
+    source: Dict[str, str],
+    mode_label: str,
+    integrity_info: Dict[str, Any],
+) -> None:
+    """Write summary.json with compact summary data."""
+
+    summary_path = os.path.join(report_dir, "summary.json")
+    totals: Dict[str, Optional[int]] = {
+        "parameters": integrity_info.get("csv_total"),
+    }
+    if integrity_info.get("csv_train") is not None:
+        totals["trainable_parameters"] = integrity_info.get("csv_train")
+
+    moe_groups_payload: List[Dict[str, Any]] = []
+    for entry in integrity_info.get("moe_groups", []):
+        moe_groups_payload.append(
+            {
+                "name": entry.get("name"),
+                "experts": entry.get("experts"),
+                "routers": entry.get("routers"),
+                "parameters": entry.get("parameters"),
+            }
+        )
+
+    payload: Dict[str, Any] = {
+        "model_id": model_id,
+        "mode": mode_label,
+        "source": source,
+        "totals": totals,
+        "integrity": {
+            "status": integrity_info.get("integrity_status", "UNKNOWN"),
+            "reasons": integrity_info.get("integrity_reasons", []),
+        },
+        "moe_groups": moe_groups_payload,
+    }
+    if integrity_info.get("model_total") is not None:
+        payload["model_parameter_total"] = integrity_info.get("model_total")
+
+    payload["integrity"]["bad_groups"] = sorted(
+        list(integrity_info.get("bad_groups", {}).keys())
+    )
+
+    with open(summary_path, "w", encoding="utf-8") as fh:
+        json.dump(payload, fh, indent=2)
+
+
 MOE_ROUTER_KEYS = ("router", "gate", "gating", "topk", "switch", "score", "routing")
 MOE_EXPERT_KEYS = ("expert", "experts", "ffn_expert", "moe", "sparse", "mixture")
-MOE_ROUTER_CLASS_HINTS = ("Router", "TopKGate", "SwitchRouter", "TopKRouter", "MoERouter")
-MOE_EXPERT_CLASS_HINTS = ("Moe", "MoE", "Sparse", "Experts", "Expert", "Mixture")
+MOE_ROUTER_CLASS_HINTS = (
+    "Router",
+    "TopKGate",
+    "SwitchRouter",
+    "TopKRouter",
+    "MoERouter",
+)
+MOE_EXPERT_CLASS_HINTS = (
+    "Moe",
+    "MoE",
+    "Sparse",
+    "Experts",
+    "Expert",
+    "Mixture",
+)
 
-def format_int(n: int) -> str:
-    return f"{n:,}"
+
+def format_int(value: int) -> str:
+    """Return a human-friendly formatted integer."""
+
+    return f"{value:,}"
+
 
 def get_parent(name: str) -> str:
+    """Return the dotted parent name for a module."""
+
     return "" if "." not in name else name.rsplit(".", 1)[0]
 
+
 def depth_of(name: str) -> int:
+    """Return the depth of a dotted module name."""
+
     return 0 if not name else name.count(".")
 
+
 def guess_is_router(name: str, cls: str) -> bool:
-    nm = name.lower()
-    if any(k in nm for k in MOE_ROUTER_KEYS):
+    """Heuristically determine whether the module appears to be a router."""
+
+    lower_name = name.lower()
+    if any(key in lower_name for key in MOE_ROUTER_KEYS):
         return True
-    if any(k.lower() in cls.lower() for k in MOE_ROUTER_CLASS_HINTS):
+    if any(key.lower() in cls.lower() for key in MOE_ROUTER_CLASS_HINTS):
         return True
     return False
+
 
 def guess_is_expert(name: str, cls: str) -> bool:
-    nm = name.lower()
-    if any(k in nm for k in MOE_EXPERT_KEYS):
+    """Heuristically determine whether the module appears to be an MoE expert."""
+
+    lower_name = name.lower()
+    if any(key in lower_name for key in MOE_EXPERT_KEYS):
         return True
-    if any(k.lower() in cls.lower() for k in MOE_EXPERT_CLASS_HINTS):
+    if any(key.lower() in cls.lower() for key in MOE_EXPERT_CLASS_HINTS):
         return True
     return False
 
+
 def nearest_moe_group(name: str, class_chain: Dict[str, str]) -> str:
+    """Return the nearest ancestor considered an MoE group."""
+
     parent = get_parent(name)
     while parent:
         cls = class_chain.get(parent, "")
@@ -152,112 +303,304 @@ def nearest_moe_group(name: str, class_chain: Dict[str, str]) -> str:
         parent = get_parent(parent)
     return ""
 
-def model_skeleton(named_modules: List[Tuple[str, nn.Module]]) -> str:
+
+def model_skeleton(named_modules: Iterable[Tuple[str, nn.Module]]) -> str:
+    """Return a textual representation of the model skeleton."""
+
     out = io.StringIO()
-    for name, mod in named_modules:
+    for name, module in named_modules:
         indent = "  " * depth_of(name)
-        cls = mod.__class__.__name__
+        cls = module.__class__.__name__
         out.write(f"{indent}{name or '<root>'} :: {cls}\n")
     return out.getvalue()
 
 
 # -----------------------------
-# Validation helpers (new)
+# Validation helpers
 # -----------------------------
+
+
+def build_class_chain(named_modules: Iterable[Tuple[str, nn.Module]]) -> Dict[str, str]:
+    """Map module names to their class names."""
+
+    return {name: module.__class__.__name__ for name, module in named_modules}
+
+
+def build_rows(
+    named_modules: Iterable[Tuple[str, nn.Module]],
+    class_chain: Dict[str, str],
+) -> Tuple[List[Row], int, int]:
+    """Construct Row entries and aggregate parameter totals."""
+
+    rows: List[Row] = []
+    total_params = 0
+    total_train = 0
+    for name, module in named_modules:
+        cls = module.__class__.__name__
+        parent = get_parent(name)
+        depth = depth_of(name)
+        n_params = sum(param.numel() for param in module.parameters(recurse=False))
+        n_trainable = sum(
+            param.numel() for param in module.parameters(recurse=False) if param.requires_grad
+        )
+        n_buffers = sum(buffer.numel() for buffer in module.buffers(recurse=False))
+        total_params += n_params
+        total_train += n_trainable
+        is_router = guess_is_router(name, cls)
+        is_expert = guess_is_expert(name, cls)
+        moe_group = nearest_moe_group(name, class_chain)
+        rows.append(
+            Row(
+                name=name,
+                cls=cls,
+                parent=parent,
+                depth=depth,
+                n_params=n_params,
+                n_trainable=n_trainable,
+                n_buffers=n_buffers,
+                is_router=is_router,
+                is_expert=is_expert,
+                moe_group=moe_group,
+            )
+        )
+    return rows, total_params, total_train
+
+
+def write_modules_csv(report_dir: str, rows: Iterable[Row]) -> str:
+    """Write modules.csv and return its path."""
+
+    path = os.path.join(report_dir, "modules.csv")
+    with open(path, "w", newline="", encoding="utf-8") as fh:
+        writer = csv.writer(fh)
+        writer.writerow(
+            [
+                "name",
+                "class",
+                "parent",
+                "depth",
+                "n_params",
+                "n_trainable",
+                "n_buffers",
+                "is_router",
+                "is_expert",
+                "moe_group",
+            ]
+        )
+        for row in rows:
+            writer.writerow(
+                [
+                    row.name,
+                    row.cls,
+                    row.parent,
+                    row.depth,
+                    row.n_params,
+                    row.n_trainable,
+                    row.n_buffers,
+                    int(row.is_router),
+                    int(row.is_expert),
+                    row.moe_group,
+                ]
+            )
+    return path
+
+
+def write_router_and_expert_csvs(report_dir: str, rows: Iterable[Row]) -> Tuple[str, str]:
+    """Write routers.csv and experts.csv, returning their paths."""
+
+    routers_path = os.path.join(report_dir, "routers.csv")
+    experts_path = os.path.join(report_dir, "experts.csv")
+
+    with open(routers_path, "w", newline="", encoding="utf-8") as fh:
+        writer = csv.writer(fh)
+        writer.writerow(["name", "class", "moe_group"])
+        for row in rows:
+            if row.is_router:
+                writer.writerow([row.name, row.cls, row.moe_group])
+
+    with open(experts_path, "w", newline="", encoding="utf-8") as fh:
+        writer = csv.writer(fh)
+        writer.writerow(["name", "class", "parent", "moe_group"])
+        for row in rows:
+            if row.is_expert:
+                writer.writerow([row.name, row.cls, row.parent, row.moe_group])
+
+    return routers_path, experts_path
+
+
+def write_skeleton(report_dir: str, named_modules: Iterable[Tuple[str, nn.Module]]) -> str:
+    """Write skeleton.txt and return its path."""
+
+    path = os.path.join(report_dir, "skeleton.txt")
+    with open(path, "w", encoding="utf-8") as fh:
+        fh.write(model_skeleton(named_modules))
+    return path
+
+
+def write_summary_text(
+    report_dir: str,
+    *,
+    endpoint: str,
+    model_id: str,
+    rows: Iterable[Row],
+    total_params: int,
+    total_train: int,
+    mode_label: str,
+) -> str:
+    """Write summary.txt and return its path."""
+
+    header = "==== vLLM Cluster Audit Summary ===="
+    if mode_label.upper() == "FAST":
+        header = "==== vLLM Cluster Audit Summary (FAST) ===="
+
+    rows_list = list(rows)
+    n_modules = len(rows_list)
+    n_routers = sum(1 for row in rows_list if row.is_router)
+    n_experts = sum(1 for row in rows_list if row.is_expert)
+
+    path = os.path.join(report_dir, "summary.txt")
+    with open(path, "w", encoding="utf-8") as fh:
+        fh.write(f"{header}\n")
+        fh.write(f"Endpoint           : {endpoint}\n")
+        fh.write(f"Model ID           : {model_id}\n")
+        fh.write(f"Modules            : {n_modules:,}\n")
+        fh.write(f"Total params       : {format_int(total_params)}\n")
+        fh.write(f"Trainable params   : {format_int(total_train)}\n")
+        fh.write(f"Routers detected   : {n_routers:,}\n")
+        fh.write(f"Experts detected   : {n_experts:,}\n")
+        fh.write(f"Reports directory  : {report_dir}\n")
+    return path
+
+
+def write_standard_artifacts(
+    report_dir: str,
+    *,
+    endpoint: str,
+    model_id: str,
+    rows: List[Row],
+    named_modules: Iterable[Tuple[str, nn.Module]],
+    total_params: int,
+    total_train: int,
+    mode_label: str,
+) -> Dict[str, str]:
+    """Write core report files shared between FAST and FULL modes."""
+
+    modules_path = write_modules_csv(report_dir, rows)
+    routers_path, experts_path = write_router_and_expert_csvs(report_dir, rows)
+    skeleton_path = write_skeleton(report_dir, named_modules)
+    summary_path = write_summary_text(
+        report_dir,
+        endpoint=endpoint,
+        model_id=model_id,
+        rows=rows,
+        total_params=total_params,
+        total_train=total_train,
+        mode_label=mode_label,
+    )
+    return {
+        "modules": modules_path,
+        "routers": routers_path,
+        "experts": experts_path,
+        "skeleton": skeleton_path,
+        "summary": summary_path,
+    }
+
 
 def write_integrity_and_moe_reports(
     report_dir: str,
-    rows: List[Row],
+    rows: Iterable[Row],
     mode_label: str,
-    model_params_full: int = None
-) -> dict:
-    """
-    - Appends CSV totals to summary.txt
-    - Writes validation_report.txt with MoE group stats
-    - If FULL mode, compares CSV total vs model parameter count and stamps PASS/FAIL
-    Returns a dict of computed integrity numbers.
-    """
-    # Aggregate CSV totals
-    sum_csv_params = sum(r.n_params for r in rows)
-    sum_csv_train  = sum(r.n_trainable for r in rows)
+    model_params_full: Optional[int] = None,
+) -> Dict[str, Any]:
+    """Write validation details and append integrity information to summary.txt."""
 
-    # MoE group accounting
-    from collections import defaultdict
-    groups = defaultdict(lambda: {"experts": 0, "routers": 0, "params": 0})
-    for r in rows:
-        mg = r.moe_group or "(none)"
-        groups[mg]["params"]  += r.n_params
-        if r.is_expert:
-            groups[mg]["experts"] += 1
-        if r.is_router:
-            groups[mg]["routers"] += 1
+    rows_list = list(rows)
+    sum_csv_params = sum(row.n_params for row in rows_list)
+    sum_csv_train = sum(row.n_trainable for row in rows_list)
 
-    # Basic MoE consistency checks
-    bad_groups = {}
-    for k, v in groups.items():
-        # (none) group is allowed to be anything; focus on actual MoE containers
-        if k == "(none)":
+    groups: Dict[str, Dict[str, int]] = {}
+    for row in rows_list:
+        moe_group = row.moe_group or "(none)"
+        if moe_group not in groups:
+            groups[moe_group] = {"experts": 0, "routers": 0, "params": 0}
+        groups[moe_group]["params"] += row.n_params
+        if row.is_expert:
+            groups[moe_group]["experts"] += 1
+        if row.is_router:
+            groups[moe_group]["routers"] += 1
+
+    bad_groups: Dict[str, Dict[str, int]] = {}
+    for group_name, stats in groups.items():
+        if group_name == "(none)":
             continue
-        # Failure conditions: no router or no experts under a declared MoE container
-        if v["routers"] == 0 or v["experts"] == 0:
-            bad_groups[k] = v
+        if stats["routers"] == 0 or stats["experts"] == 0:
+            bad_groups[group_name] = stats
 
-    # Write validation report
-    vr_path = os.path.join(report_dir, "validation_report.txt")
-    with open(vr_path, "w") as vf:
-        vf.write(f"==== Validation Report ({mode_label}) ====\n")
-        vf.write(f"CSV param total     : {format_int(sum_csv_params)}\n")
-        vf.write(f"CSV trainable total : {format_int(sum_csv_train)}\n\n")
-        vf.write("MoE group summary (top 50 by params):\n")
-        # Sort MoE groups by params descending
-        sorted_groups = sorted(groups.items(), key=lambda kv: kv[1]["params"], reverse=True)
-        for k, v in sorted_groups[:50]:
-            vf.write(f"[moe] {k:70s} params={format_int(v['params'])} experts={v['experts']:>4} routers={v['routers']:>3}\n")
+    validation_path = os.path.join(report_dir, "validation_report.txt")
+    sorted_groups = sorted(
+        groups.items(), key=lambda kv: kv[1]["params"], reverse=True
+    )
+    with open(validation_path, "w", encoding="utf-8") as fh:
+        fh.write(f"==== Validation Report ({mode_label}) ====\n")
+        fh.write(f"CSV param total     : {format_int(sum_csv_params)}\n")
+        fh.write(f"CSV trainable total : {format_int(sum_csv_train)}\n\n")
+        fh.write("MoE group summary (top 50 by params):\n")
+        for name, stats in sorted_groups[:50]:
+            fh.write(
+                f"[moe] {name:70s} params={format_int(stats['params'])} "
+                f"experts={stats['experts']:>4} routers={stats['routers']:>3}\n"
+            )
         if bad_groups:
-            vf.write("\n[warn] Incomplete MoE groups detected (missing router or experts):\n")
-            for k, v in bad_groups.items():
-                vf.write(f"  - {k}: experts={v['experts']} routers={v['routers']}\n")
-
-        # FULL-only: compare model total vs CSV total
+            fh.write("\n[warn] Incomplete MoE groups detected (missing router or experts):\n")
+            for name, stats in bad_groups.items():
+                fh.write(
+                    f"  - {name}: experts={stats['experts']} routers={stats['routers']}\n"
+                )
         if model_params_full is not None:
             delta = abs(model_params_full - sum_csv_params)
-            vf.write("\nModel total vs CSV total:\n")
-            vf.write(f"  Model param total : {format_int(model_params_full)}\n")
-            vf.write(f"  CSV param total   : {format_int(sum_csv_params)}\n")
-            vf.write(f"  Delta             : {format_int(delta)}\n")
+            fh.write("\nModel total vs CSV total:\n")
+            fh.write(f"  Model param total : {format_int(model_params_full)}\n")
+            fh.write(f"  CSV param total   : {format_int(sum_csv_params)}\n")
+            fh.write(f"  Delta             : {format_int(delta)}\n")
 
-    # Append to summary and stamp PASS/FAIL
     summary_path = os.path.join(report_dir, "summary.txt")
-    with open(summary_path, "a") as sf:
-        sf.write(f"CSV param total     : {format_int(sum_csv_params)}\n")
-        sf.write(f"CSV trainable total : {format_int(sum_csv_train)}\n")
-
-        status = "PASS"
-        reasons = []
-
+    status = "PASS"
+    reasons: List[str] = []
+    with open(summary_path, "a", encoding="utf-8") as fh:
+        fh.write(f"CSV param total     : {format_int(sum_csv_params)}\n")
+        fh.write(f"CSV trainable total : {format_int(sum_csv_train)}\n")
         if bad_groups:
             status = "FAIL"
             reasons.append(f"{len(bad_groups)} incomplete MoE group(s)")
-
         if model_params_full is not None:
             delta = abs(model_params_full - sum_csv_params)
-            sf.write(f"Model param total   : {format_int(model_params_full)}\n")
-            sf.write(f"Param delta         : {format_int(delta)}\n")
-            # Accept small non-zero deltas in case of tied embeddings or special tying (set to 0 to be strict)
+            fh.write(f"Model param total   : {format_int(model_params_full)}\n")
+            fh.write(f"Param delta         : {format_int(delta)}\n")
             if delta != 0:
                 status = "FAIL"
                 reasons.append("model vs CSV param mismatch")
-
         if reasons:
-            sf.write(f"INTEGRITY STATUS    : {status}  ({'; '.join(reasons)})\n")
+            fh.write(f"INTEGRITY STATUS    : {status}  ({'; '.join(reasons)})\n")
         else:
-            sf.write("INTEGRITY STATUS    : PASS\n")
+            fh.write("INTEGRITY STATUS    : PASS\n")
+
+    moe_group_entries = [
+        {
+            "name": name,
+            "experts": stats["experts"],
+            "routers": stats["routers"],
+            "parameters": stats["params"],
+        }
+        for name, stats in sorted_groups
+    ]
 
     return {
         "csv_total": sum_csv_params,
         "csv_train": sum_csv_train,
         "bad_groups": bad_groups,
         "model_total": model_params_full,
+        "integrity_status": status,
+        "integrity_reasons": reasons[:],
+        "moe_groups": moe_group_entries,
     }
 
 
@@ -265,169 +608,163 @@ def write_integrity_and_moe_reports(
 # Hooks (one-shot, full mode)
 # -----------------------------
 
-def attach_example_hooks(model: nn.Module, example_routers: List[str], example_experts: List[str], log_writer) -> List:
-    handles = []
-    def _once(fn):
-        fired = {"v": False}
-        def wrap(*a, **kw):
-            if not fired["v"]:
-                fired["v"] = True
-                return fn(*a, **kw)
-        return wrap
+
+def attach_example_hooks(
+    model: nn.Module,
+    example_routers: List[str],
+    example_experts: List[str],
+    log_writer,
+) -> List[Any]:
+    """Attach one-shot hooks to representative router/expert modules."""
+
+    handles: List[Any] = []
+
+    def once(fn):
+        fired = {"value": False}
+
+        def wrapper(*args, **kwargs):
+            if not fired["value"]:
+                fired["value"] = True
+                return fn(*args, **kwargs)
+
+        return wrapper
 
     if example_routers:
-        m = dict(model.named_modules()).get(example_routers[0])
-        if m is not None:
-            def router_hook(mod, inp, out):
+        module = dict(model.named_modules()).get(example_routers[0])
+        if module is not None:
+
+            def router_hook(mod, inputs, outputs):
                 with torch.no_grad():
                     try:
-                        t = out[0] if isinstance(out, tuple) else out
-                        log_writer(f"[router:{example_routers[0]}] out shape: {tuple(t.shape)}")
-                    except Exception as e:
-                        log_writer(f"[router:{example_routers[0]}] hook error: {e}")
-            handles.append(m.register_forward_hook(_once(router_hook)))
+                        tensor = outputs[0] if isinstance(outputs, tuple) else outputs
+                        log_writer(
+                            f"[router:{example_routers[0]}] out shape: {tuple(tensor.shape)}"
+                        )
+                    except Exception as exc:  # pragma: no cover - defensive
+                        log_writer(f"[router:{example_routers[0]}] hook error: {exc}")
+
+            handles.append(module.register_forward_hook(once(router_hook)))
 
     if example_experts:
-        m = dict(model.named_modules()).get(example_experts[0])
-        if m is not None:
-            def expert_hook(mod, inp, out):
+        module = dict(model.named_modules()).get(example_experts[0])
+        if module is not None:
+
+            def expert_hook(mod, inputs, outputs):
                 with torch.no_grad():
                     try:
-                        t = out if isinstance(out, torch.Tensor) else out[0]
-                        mean = t.float().mean().item()
-                        std  = t.float().std().item()
-                        log_writer(f"[expert:{example_experts[0]}] out mean={mean:.4f} std={std:.4f} shape={tuple(t.shape)}")
-                    except Exception as e:
-                        log_writer(f"[expert:{example_experts[0]}] hook error: {e}")
-            handles.append(m.register_forward_hook(_once(expert_hook)))
+                        tensor = outputs if isinstance(outputs, torch.Tensor) else outputs[0]
+                        mean = tensor.float().mean().item()
+                        std = tensor.float().std().item()
+                        log_writer(
+                            f"[expert:{example_experts[0]}] out mean={mean:.4f} "
+                            f"std={std:.4f} shape={tuple(tensor.shape)}"
+                        )
+                    except Exception as exc:  # pragma: no cover - defensive
+                        log_writer(f"[expert:{example_experts[0]}] hook error: {exc}")
+
+            handles.append(module.register_forward_hook(once(expert_hook)))
 
     return handles
 
 
 # -----------------------------
-# Main
+# Mode runners
 # -----------------------------
 
-def main():
-    args = parse_args()
 
-    # Determine model id
-    models_payload = None
-    if args.model:
-        model_id = args.model
-    else:
-        models_payload = get_models_from_endpoint(args.endpoint)
-        model_id = pick_model_id(models_payload)
-        if not model_id:
-            raise SystemExit("Could not infer a model id from endpoint payload.")
+def write_endpoint_payload(report_dir: str, endpoint: str, payload: Dict[str, Any]) -> None:
+    """Persist the endpoint payload for later inspection."""
 
-    # Report dir
-    ts = dt.datetime.now().strftime("%Y%m%d_%H%M%S")
-    safe_mid = re.sub(r'[^a-zA-Z0-9_.\\-]+', '_', model_id)
-    report_dir = os.path.join(args.outdir, f"{ts}_{safe_mid}")
-    os.makedirs(report_dir, exist_ok=True)
+    path = os.path.join(report_dir, "endpoint.json")
+    with open(path, "w", encoding="utf-8") as fh:
+        json.dump({"endpoint": endpoint, "models_payload": payload}, fh, indent=2)
 
-    if models_payload is not None:
-        with open(os.path.join(report_dir, "endpoint.json"), "w") as f:
-            json.dump({"endpoint": args.endpoint, "models_payload": models_payload}, f, indent=2)
 
-    # Config
-    try:
-        cfg = AutoConfig.from_pretrained(model_id, trust_remote_code=True)
-    except Exception:
-        cfg = None
+def run_fast_mode(
+    cfg: AutoConfig,
+    *,
+    report_dir: str,
+    endpoint: str,
+    model_id: str,
+    source_info: Dict[str, str],
+    json_output: bool,
+) -> Dict[str, Any]:
+    """Execute FAST mode using empty weights."""
 
-    # ------------------ FAST mode (no weights) ------------------
-    if args.fast:
-        if cfg is None:
-            raise SystemExit("--fast requested but AutoConfig failed; cannot proceed.")
-        if not ACCEL_AVAILABLE:
-            raise SystemExit("--fast requires 'accelerate' (pip install accelerate)")
-        print("[info] FAST mode: building skeleton with empty weights (no real weight loading)")
-        with init_empty_weights():
+    if not ACCEL_AVAILABLE:
+        logger.error("[error] FAST mode requires 'accelerate' (pip install accelerate)")
+        sys.exit(1)
+
+    logger.info("[info] FAST mode: building skeleton with empty weights (no real weight loading)")
+    with init_empty_weights():
+        try:
             try:
-                # Try CausalLM first; many VLMs need base AutoModel
-                try:
-                    tmp_model = AutoModelForCausalLM.from_config(cfg, trust_remote_code=True)
-                except Exception:
-                    tmp_model = AutoModel.from_config(cfg, trust_remote_code=True)
-            except Exception as e:
-                raise SystemExit(f"Failed to instantiate model from config: {e}")
+                tmp_model = AutoModelForCausalLM.from_config(cfg, trust_remote_code=True)
+            except Exception:
+                tmp_model = AutoModel.from_config(cfg, trust_remote_code=True)
+        except Exception as exc:
+            logger.error("[error] Failed to instantiate model from config: %s", exc)
+            sys.exit(1)
 
-        class_chain: Dict[str, str] = {}
-        named_mods = list(tmp_model.named_modules())
-        for name, mod in named_mods:
-            class_chain[name] = mod.__class__.__name__
+    named_modules = list(tmp_model.named_modules())
+    class_chain = build_class_chain(named_modules)
+    rows, total_params, total_train = build_rows(named_modules, class_chain)
 
-        rows: List[Row] = []
-        total_params = 0
-        total_train = 0
-        for name, mod in named_mods:
-            cls = mod.__class__.__name__
-            parent = get_parent(name)
-            depth = depth_of(name)
-            # Empty-weights still has shapes; numel() is valid
-            n_params = sum(p.numel() for p in mod.parameters(recurse=False))
-            n_train  = sum(p.numel() for p in mod.parameters(recurse=False) if p.requires_grad)
-            n_buffers = sum(b.numel() for b in mod.buffers(recurse=False))
-            total_params += n_params
-            total_train += n_train
-            is_router = guess_is_router(name, cls)
-            is_expert = guess_is_expert(name, cls)
-            moe_group = nearest_moe_group(name, class_chain)
-            rows.append(Row(name, cls, parent, depth, n_params, n_train, n_buffers, is_router, is_expert, moe_group))
+    artifacts = write_standard_artifacts(
+        report_dir,
+        endpoint=endpoint,
+        model_id=model_id,
+        rows=rows,
+        named_modules=named_modules,
+        total_params=total_params,
+        total_train=total_train,
+        mode_label="FAST",
+    )
 
-        # Write files
-        mods_csv = os.path.join(report_dir, "modules.csv")
-        with open(mods_csv, "w", newline="") as f:
-            w = csv.writer(f)
-            w.writerow(["name", "class", "parent", "depth", "n_params", "n_trainable", "n_buffers", "is_router", "is_expert", "moe_group"])
-            for r in rows:
-                w.writerow([r.name, r.cls, r.parent, r.depth, r.n_params, r.n_trainable, r.n_buffers, int(r.is_router), int(r.is_expert), r.moe_group])
+    integrity_info = write_integrity_and_moe_reports(
+        report_dir=report_dir,
+        rows=rows,
+        mode_label="FAST",
+        model_params_full=None,
+    )
 
-        routers_csv = os.path.join(report_dir, "routers.csv")
-        experts_csv = os.path.join(report_dir, "experts.csv")
-        with open(routers_csv, "w", newline="") as f:
-            w = csv.writer(f); w.writerow(["name", "class", "moe_group"])
-            for r in rows:
-                if r.is_router: w.writerow([r.name, r.cls, r.moe_group])
-        with open(experts_csv, "w", newline="") as f:
-            w = csv.writer(f); w.writerow(["name", "class", "parent", "moe_group"])
-            for r in rows:
-                if r.is_expert: w.writerow([r.name, r.cls, r.parent, r.moe_group])
+    if json_output:
+        try:
+            write_modules_json(report_dir, rows)
+            write_summary_json(
+                report_dir,
+                model_id=model_id,
+                source=source_info,
+                mode_label="FAST",
+                integrity_info=integrity_info,
+            )
+        except Exception as exc:
+            logger.error("[error] Failed to write JSON outputs: %s", exc)
+            sys.exit(1)
 
-        skeleton_txt = os.path.join(report_dir, "skeleton.txt")
-        with open(skeleton_txt, "w") as f:
-            f.write(model_skeleton(named_mods))
+    logger.info("[done][FAST] Wrote reports to: %s", report_dir)
+    logger.info(
+        "[done][FAST] Key files: %s, %s, %s, %s, %s",
+        artifacts["modules"],
+        artifacts["skeleton"],
+        artifacts["routers"],
+        artifacts["experts"],
+        artifacts["summary"],
+    )
+    return integrity_info
 
-        summary_txt = os.path.join(report_dir, "summary.txt")
-        n_mods = len(rows)
-        n_routers = sum(1 for r in rows if r.is_router)
-        n_experts = sum(1 for r in rows if r.is_expert)
-        with open(summary_txt, "w") as f:
-            f.write("==== vLLM Cluster Audit Summary (FAST) ====\n")
-            f.write(f"Endpoint           : {args.endpoint}\n")
-            f.write(f"Model ID           : {model_id}\n")
-            f.write(f"Modules            : {n_mods:,}\n")
-            f.write(f"Total params       : {format_int(total_params)}\n")
-            f.write(f"Trainable params   : {format_int(total_train)}\n")
-            f.write(f"Routers detected   : {n_routers:,}\n")
-            f.write(f"Experts detected   : {n_experts:,}\n")
-            f.write(f"Reports directory  : {report_dir}\n")
 
-        # ---- SAFETY CHECKS (FAST) ----
-        write_integrity_and_moe_reports(
-            report_dir=report_dir,
-            rows=rows,
-            mode_label="FAST",
-            model_params_full=None,   # no real weights in FAST mode
-        )
+def run_full_mode(
+    *,
+    report_dir: str,
+    endpoint: str,
+    model_id: str,
+    source_info: Dict[str, str],
+    json_output: bool,
+    no_hooks: bool,
+) -> Dict[str, Any]:
+    """Execute FULL mode by loading real model weights."""
 
-        print(f"[done][FAST] Wrote reports to: {report_dir}")
-        print(f"[done][FAST] Key files: {mods_csv}, {skeleton_txt}, {routers_csv}, {experts_csv}, {summary_txt}")
-        return
-
-    # ------------------ Full mode (real weights) ------------------
     if torch.cuda.is_available() and is_torch_bf16_gpu_available():
         dtype = torch.bfloat16
     elif torch.cuda.is_available():
@@ -435,19 +772,25 @@ def main():
     else:
         dtype = torch.float32
 
-    device_map = "auto" if torch.cuda.is_available() else {"": "cpu"}
+    device_map: Any
+    if torch.cuda.is_available():
+        device_map = "auto"
+    else:
+        device_map = {"": "cpu"}
 
-    print(f"[info] Loading model '{model_id}' (dtype={dtype}, device_map={device_map}) ...")
+    logger.info("[info] Loading model '%s' (dtype=%s, device_map=%s) ...", model_id, dtype, device_map)
     try:
-        # VLM-friendly first try
         model = AutoModel.from_pretrained(
             model_id,
             dtype=dtype,
             device_map=device_map,
             trust_remote_code=True,
         )
-    except Exception as e:
-        print(f"[warn] AutoModel load failed ({e}); trying AutoModelForCausalLM ...")
+    except Exception as exc:
+        logger.warning(
+            "[warn] AutoModel load failed (%s); trying AutoModelForCausalLM ...",
+            exc,
+        )
         model = AutoModelForCausalLM.from_pretrained(
             model_id,
             dtype=dtype,
@@ -456,103 +799,188 @@ def main():
         )
     model.eval()
 
-    # Enumerate
-    class_chain: Dict[str, str] = {}
-    named_mods = list(model.named_modules())
-    for name, mod in named_mods:
-        class_chain[name] = mod.__class__.__name__
+    named_modules = list(model.named_modules())
+    class_chain = build_class_chain(named_modules)
+    rows, total_params, total_train = build_rows(named_modules, class_chain)
 
-    rows: List[Row] = []
-    total_params = 0
-    total_train = 0
-    for name, mod in named_mods:
-        cls = mod.__class__.__name__
-        parent = get_parent(name)
-        depth = depth_of(name)
-        n_params = sum(p.numel() for p in mod.parameters(recurse=False))
-        n_train  = sum(p.numel() for p in mod.parameters(recurse=False) if p.requires_grad)
-        n_buffers = sum(b.numel() for b in mod.buffers(recurse=False))
-        total_params += n_params
-        total_train += n_train
-        is_router = guess_is_router(name, cls)
-        is_expert = guess_is_expert(name, cls)
-        moe_group = nearest_moe_group(name, class_chain)
-        rows.append(Row(name, cls, parent, depth, n_params, n_train, n_buffers, is_router, is_expert, moe_group))
+    artifacts = write_standard_artifacts(
+        report_dir,
+        endpoint=endpoint,
+        model_id=model_id,
+        rows=rows,
+        named_modules=named_modules,
+        total_params=total_params,
+        total_train=total_train,
+        mode_label="FULL",
+    )
 
-    # Write files
-    mods_csv = os.path.join(report_dir, "modules.csv")
-    with open(mods_csv, "w", newline="") as f:
-        w = csv.writer(f)
-        w.writerow(["name", "class", "parent", "depth", "n_params", "n_trainable", "n_buffers", "is_router", "is_expert", "moe_group"])
-        for r in rows:
-            w.writerow([r.name, r.cls, r.parent, r.depth, r.n_params, r.n_trainable, r.n_buffers, int(r.is_router), int(r.is_expert), r.moe_group])
-
-    routers_csv = os.path.join(report_dir, "routers.csv")
-    experts_csv = os.path.join(report_dir, "experts.csv")
-    with open(routers_csv, "w", newline="") as f:
-        w = csv.writer(f); w.writerow(["name", "class", "moe_group"])
-        for r in rows:
-            if r.is_router: w.writerow([r.name, r.cls, r.moe_group])
-    with open(experts_csv, "w", newline="") as f:
-        w = csv.writer(f); w.writerow(["name", "class", "parent", "moe_group"])
-        for r in rows:
-            if r.is_expert: w.writerow([r.name, r.cls, r.parent, r.moe_group])
-
-    skeleton_txt = os.path.join(report_dir, "skeleton.txt")
-    with open(skeleton_txt, "w") as f:
-        f.write(model_skeleton(named_mods))
-
-    summary_txt = os.path.join(report_dir, "summary.txt")
-    n_mods = len(rows)
-    n_routers = sum(1 for r in rows if r.is_router)
-    n_experts = sum(1 for r in rows if r.is_expert)
-    with open(summary_txt, "w") as f:
-        f.write("==== vLLM Cluster Audit Summary ====\n")
-        f.write(f"Endpoint           : {args.endpoint}\n")
-        f.write(f"Model ID           : {model_id}\n")
-        f.write(f"Modules            : {n_mods:,}\n")
-        f.write(f"Total params       : {format_int(total_params)}\n")
-        f.write(f"Trainable params   : {format_int(total_train)}\n")
-        f.write(f"Routers detected   : {n_routers:,}\n")
-        f.write(f"Experts detected   : {n_experts:,}\n")
-        f.write(f"Reports directory  : {report_dir}\n")
-
-    # ---- SAFETY CHECKS (FULL) ----
-    model_params = sum(p.numel() for p in model.parameters())
-    write_integrity_and_moe_reports(
+    model_params = sum(param.numel() for param in model.parameters())
+    integrity_info = write_integrity_and_moe_reports(
         report_dir=report_dir,
         rows=rows,
         mode_label="FULL",
         model_params_full=model_params,
     )
 
-    # Hooks (full mode only; useful mainly for CausalLMs)
-    if not args.no_hooks:
+    if not no_hooks:
         hook_log = os.path.join(report_dir, "hook_log.txt")
-        def log_writer(s: str):
-            with open(hook_log, "a") as fh:
-                fh.write(s + "\n")
-            print(s)
 
-        example_routers = [r.name for r in rows if r.is_router][:1]
-        example_experts = [r.name for r in rows if r.is_expert][:1]
+        def log_writer(message: str) -> None:
+            with open(hook_log, "a", encoding="utf-8") as fh:
+                fh.write(message + "\n")
+            logger.info(message)
+
+        example_routers = [row.name for row in rows if row.is_router][:1]
+        example_experts = [row.name for row in rows if row.is_expert][:1]
         handles = attach_example_hooks(model, example_routers, example_experts, log_writer)
 
         try:
-            tok = AutoTokenizer.from_pretrained(model_id, trust_remote_code=True, use_fast=True)
+            tokenizer = AutoTokenizer.from_pretrained(
+                model_id, trust_remote_code=True, use_fast=True
+            )
         except Exception:
-            tok = None
-        if tok is not None:
+            tokenizer = None
+        if tokenizer is not None:
             device0 = next(model.parameters()).device
-            enc = tok("A short test prompt for model introspection.", return_tensors="pt").to(device0)
+            encoded = tokenizer(
+                "A short test prompt for model introspection.",
+                return_tensors="pt",
+            ).to(device0)
             with torch.no_grad():
-                _ = model.generate(**enc, max_new_tokens=8)
-        for h in handles:
+                model.generate(**encoded, max_new_tokens=8)
+        for handle in handles:
             with contextlib.suppress(Exception):
-                h.remove()
+                handle.remove()
 
-    print(f"[done] Wrote reports to: {report_dir}")
-    print(f"[done] Key files: {mods_csv}, {skeleton_txt}, {routers_csv}, {experts_csv}, {summary_txt}, validation_report.txt")
+    if json_output:
+        try:
+            write_modules_json(report_dir, rows)
+            write_summary_json(
+                report_dir,
+                model_id=model_id,
+                source=source_info,
+                mode_label="FULL",
+                integrity_info=integrity_info,
+            )
+        except Exception as exc:
+            logger.error("[error] Failed to write JSON outputs: %s", exc)
+            sys.exit(1)
+
+    logger.info("[done] Wrote reports to: %s", report_dir)
+    logger.info(
+        "[done] Key files: %s, %s, %s, %s, %s, validation_report.txt",
+        artifacts["modules"],
+        artifacts["skeleton"],
+        artifacts["routers"],
+        artifacts["experts"],
+        artifacts["summary"],
+    )
+    return integrity_info
+
+
+def handle_integrity_failure(mode_label: str, integrity_info: Dict[str, Any]) -> None:
+    """Exit if integrity checks failed for the provided mode."""
+
+    status = (integrity_info or {}).get("integrity_status", "UNKNOWN")
+    if status != "FAIL":
+        return
+    reasons = (integrity_info or {}).get("integrity_reasons", [])
+    reason_text = f" ({'; '.join(reasons)})" if reasons else ""
+    logger.error("[fail] Integrity checks failed in %s mode%s", mode_label, reason_text)
+    sys.exit(1)
+
+
+# -----------------------------
+# Main
+# -----------------------------
+
+
+def create_report_dir(outdir: str, model_id: str) -> str:
+    """Create the timestamped report directory for the run."""
+
+    timestamp = dt.datetime.now().strftime("%Y%m%d_%H%M%S")
+    safe_model_id = re.sub(r"[^a-zA-Z0-9_.\\-]+", "_", model_id)
+    report_dir = os.path.join(outdir, f"{timestamp}_{safe_model_id}")
+    try:
+        os.makedirs(report_dir, exist_ok=True)
+    except OSError as exc:
+        logger.error("[error] Failed to create report directory '%s': %s", report_dir, exc)
+        sys.exit(1)
+    return report_dir
+
+
+def main() -> None:
+    """Entry point for running the vLLM cluster audit."""
+
+    args = parse_args()
+    configure_logging(args.verbosity)
+    fast_mode = resolve_fast_mode(args)
+    logger.debug(
+        "Resolved mode: fast_mode=%s (mode arg=%s, legacy --fast=%s)",
+        fast_mode,
+        args.mode,
+        args.fast,
+    )
+
+    models_payload: Optional[Dict[str, Any]] = None
+    if args.model:
+        model_id = args.model
+    else:
+        try:
+            models_payload = get_models_from_endpoint(args.endpoint)
+        except Exception as exc:
+            logger.error("[error] Failed to query endpoint '%s': %s", args.endpoint, exc)
+            sys.exit(1)
+        try:
+            model_id = pick_model_id(models_payload)
+        except Exception as exc:
+            logger.error("[error] Failed to pick a model id from endpoint payload: %s", exc)
+            sys.exit(1)
+        if not model_id:
+            logger.error("[error] Could not infer a model id from endpoint payload.")
+            sys.exit(1)
+
+    if args.model:
+        source_info = {"type": "model_argument", "value": args.model}
+    else:
+        source_info = {"type": "endpoint_discovery", "endpoint": args.endpoint}
+
+    report_dir = create_report_dir(args.outdir, model_id)
+
+    if models_payload is not None:
+        write_endpoint_payload(report_dir, args.endpoint, models_payload)
+
+    try:
+        cfg = AutoConfig.from_pretrained(model_id, trust_remote_code=True)
+    except Exception:
+        cfg = None
+
+    if fast_mode:
+        if cfg is None:
+            logger.error(
+                "[error] FAST mode requested but AutoConfig failed; cannot proceed."
+            )
+            sys.exit(1)
+        integrity_info = run_fast_mode(
+            cfg,
+            report_dir=report_dir,
+            endpoint=args.endpoint,
+            model_id=model_id,
+            source_info=source_info,
+            json_output=args.json_output,
+        )
+        handle_integrity_failure("FAST", integrity_info)
+        return
+
+    integrity_info = run_full_mode(
+        report_dir=report_dir,
+        endpoint=args.endpoint,
+        model_id=model_id,
+        source_info=source_info,
+        json_output=args.json_output,
+        no_hooks=args.no_hooks,
+    )
+    handle_integrity_failure("FULL", integrity_info)
 
 
 if __name__ == "__main__":
