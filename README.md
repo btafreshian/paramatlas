@@ -43,6 +43,20 @@ python audit_vllm_cluster.py --endpoint http://localhost:8000 --fast
 
 ---
 
+## 🧪 End-to-end walkthrough
+
+```bash
+python audit_vllm_cluster.py --model mistralai/Mixtral-8x7B-Instruct-v0.1 --fast
+```
+
+1. Run the command from a clean shell after installing the dependencies above; the script downloads the model `config.json` and prepares a fresh timestamped folder under `./reports/`.
+2. FAST mode skips weight downloads, builds the module skeleton directly from the configuration, and flags MoE components while streaming progress to stdout.
+3. When the run finishes, open the newest folder inside `reports/` to find the generated text and CSV artifacts.
+
+The report surfaces the nested module layout, per-module parameter counts, MoE router/expert groupings, integrity checks, and (when applicable) endpoint metadata so you can audit structure, size, and distribution at a glance.
+
+---
+
 ## 📦 What you get (per run)
 
 Each run writes a timestamped folder under `./reports/…` containing:
@@ -56,6 +70,19 @@ Each run writes a timestamped folder under `./reports/…` containing:
 | `validation_report.txt` | MoE per-group stats (experts/routers/params), warnings, and (full mode) model vs CSV totals. |
 | `hook_log.txt` | (Full mode + hooks only) one-shot shapes/stats from first router/expert. |
 | `endpoint.json` | Only when `--endpoint` is used; records `/v1/models` payload. |
+
+---
+
+## 📂 Understanding the output files
+
+- `summary.txt` — headline counts, integrity verdict, and any warnings so you can sanity-check runs without opening spreadsheets.
+- `skeleton.txt` — the hierarchical module tree with dotted names and classes, ideal for spotting unexpected blocks or missing layers.
+- `modules.csv` — per-module metrics (parameters, buffers, depth, MoE flags) ready for scripting, pivoting, or diffing across runs.
+- `routers.csv` — filtered view of detected routers, useful when validating MoE routing patterns or comparing load-balancing modules.
+- `experts.csv` — list of MoE experts with group metadata so you can verify multiplicity and parameter allocation.
+- `validation_report.txt` — textual audit of MoE group integrity plus (in full mode) parameter deltas against instantiated weights.
+- `hook_log.txt` — emitted only when hooks run; captures the first observed tensor shapes/statistics for rapid sanity checks.
+- `endpoint.json` — saved when an endpoint is used; mirrors the `/v1/models` response so you can record server-side model metadata.
 
 ---
 
@@ -170,6 +197,22 @@ for k,v in sorted(g.items(), key=lambda kv: kv[1]['params'], reverse=True)[:20]:
     print(f"{k:60s}  params={v['params']:>12,}  experts={v['experts']:>4}  routers={v['routers']:>3}")
 PY
 ```
+
+---
+
+## 🔗 Integration hints
+
+ParamAtlas can be scripted from notebooks or CI jobs: invoke `audit_vllm_cluster.py` with the desired `--model` or `--endpoint`, then load `modules.csv`, `routers.csv`, or `experts.csv` into pandas to drive dashboards, regression checks, or automated alerts using the same data schema the CLI produces.
+
+---
+
+## 🛑 Common problems and troubleshooting
+
+- **Missing dependencies (`transformers`, `accelerate`, `torch`):** reinstall using the `pip install` command from the quickstart or recreate your virtual environment with compatible versions pinned.
+- **Endpoint discovery failures (`/v1/models` errors, timeouts):** verify the vLLM server is reachable, credentials or proxies are configured, and rerun with `--model` pointing directly at the desired Hugging Face id as a fallback.
+- **Invalid model id or local path:** double-check the spelling, ensure the repository exposes a `config.json`, and, for local paths, confirm the directory contains the expected Transformers files.
+- **Out-of-memory during full mode:** switch to `--fast`, audit a smaller checkpoint, or run on hardware with additional VRAM/system RAM to support full weight instantiation.
+- **Permission errors writing to `reports/`:** change the `--outdir` to a writable location or adjust filesystem permissions so the process can create timestamped report folders.
 
 ---
 
