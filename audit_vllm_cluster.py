@@ -38,8 +38,10 @@ import csv
 import datetime as dt
 import io
 import json
+import logging
 import os
 import re
+import sys
 from dataclasses import dataclass
 from typing import Dict, List, Tuple
 
@@ -58,6 +60,9 @@ except Exception:
     ACCEL_AVAILABLE = False
 
 
+logger = logging.getLogger("audit_vllm_cluster")
+
+
 # -----------------------------
 # CLI
 # -----------------------------
@@ -69,10 +74,14 @@ def parse_args():
     ap.add_argument("--model", default=None,
                     help="Optional HF model id or local path to skip endpoint discovery (e.g., Qwen/Qwen3-VL-30B-A3B-Instruct)")
     ap.add_argument("--no-hooks", action="store_true", help="Disable tiny one-shot hooks sanity check (full mode only)")
+    ap.add_argument("--mode", choices=["fast", "full"], default=None,
+                    help="Select run mode explicitly: fast (empty weights) or full (load real weights)")
     ap.add_argument("--fast", action="store_true", help="FAST: build skeleton & counts from config with empty weights (no real weight load)")
     ap.add_argument("--outdir", default="reports", help="Directory to create report folder in")
     ap.add_argument("--json-output", action="store_true",
                     help="Also emit summary.json and modules.json alongside existing reports")
+    ap.add_argument("-v", "--verbosity", choices=["quiet", "normal", "verbose"], default="normal",
+                    help="Logging verbosity: quiet, normal, or verbose (default: normal)")
     return ap.parse_args()
 
 
@@ -394,15 +403,47 @@ def attach_example_hooks(model: nn.Module, example_routers: List[str], example_e
 def main():
     args = parse_args()
 
+    verbosity_levels = {
+        "quiet": logging.WARNING,
+        "normal": logging.INFO,
+        "verbose": logging.DEBUG,
+    }
+    log_level = verbosity_levels.get(args.verbosity, logging.INFO)
+    logging.basicConfig(level=log_level, format="%(message)s")
+    logger.setLevel(log_level)
+
+    if args.mode == "fast":
+        fast_mode = True
+    elif args.mode == "full":
+        fast_mode = False
+    else:
+        fast_mode = args.fast
+
+    logger.debug(
+        "Resolved mode: fast_mode=%s (mode arg=%s, legacy --fast=%s)",
+        fast_mode,
+        args.mode,
+        args.fast,
+    )
+
     # Determine model id
     models_payload = None
     if args.model:
         model_id = args.model
     else:
-        models_payload = get_models_from_endpoint(args.endpoint)
-        model_id = pick_model_id(models_payload)
+        try:
+            models_payload = get_models_from_endpoint(args.endpoint)
+        except Exception as e:
+            logger.error("[error] Failed to query endpoint '%s': %s", args.endpoint, e)
+            sys.exit(1)
+        try:
+            model_id = pick_model_id(models_payload)
+        except Exception as e:
+            logger.error("[error] Failed to pick a model id from endpoint payload: %s", e)
+            sys.exit(1)
         if not model_id:
-            raise SystemExit("Could not infer a model id from endpoint payload.")
+            logger.error("[error] Could not infer a model id from endpoint payload.")
+            sys.exit(1)
 
     if args.model:
         source_info = {"type": "model_argument", "value": args.model}
@@ -413,7 +454,11 @@ def main():
     ts = dt.datetime.now().strftime("%Y%m%d_%H%M%S")
     safe_mid = re.sub(r'[^a-zA-Z0-9_.\\-]+', '_', model_id)
     report_dir = os.path.join(args.outdir, f"{ts}_{safe_mid}")
-    os.makedirs(report_dir, exist_ok=True)
+    try:
+        os.makedirs(report_dir, exist_ok=True)
+    except OSError as e:
+        logger.error("[error] Failed to create report directory '%s': %s", report_dir, e)
+        sys.exit(1)
 
     if models_payload is not None:
         with open(os.path.join(report_dir, "endpoint.json"), "w") as f:
@@ -426,12 +471,14 @@ def main():
         cfg = None
 
     # ------------------ FAST mode (no weights) ------------------
-    if args.fast:
+    if fast_mode:
         if cfg is None:
-            raise SystemExit("--fast requested but AutoConfig failed; cannot proceed.")
+            logger.error("[error] FAST mode requested but AutoConfig failed; cannot proceed.")
+            sys.exit(1)
         if not ACCEL_AVAILABLE:
-            raise SystemExit("--fast requires 'accelerate' (pip install accelerate)")
-        print("[info] FAST mode: building skeleton with empty weights (no real weight loading)")
+            logger.error("[error] FAST mode requires 'accelerate' (pip install accelerate)")
+            sys.exit(1)
+        logger.info("[info] FAST mode: building skeleton with empty weights (no real weight loading)")
         with init_empty_weights():
             try:
                 # Try CausalLM first; many VLMs need base AutoModel
@@ -440,7 +487,8 @@ def main():
                 except Exception:
                     tmp_model = AutoModel.from_config(cfg, trust_remote_code=True)
             except Exception as e:
-                raise SystemExit(f"Failed to instantiate model from config: {e}")
+                logger.error("[error] Failed to instantiate model from config: %s", e)
+                sys.exit(1)
 
         class_chain: Dict[str, str] = {}
         named_mods = list(tmp_model.named_modules())
@@ -522,11 +570,18 @@ def main():
                     integrity_info=integrity_info,
                 )
             except Exception as e:
-                print(f"[error] Failed to write JSON outputs: {e}")
-                raise
+                logger.error("[error] Failed to write JSON outputs: %s", e)
+                sys.exit(1)
 
-        print(f"[done][FAST] Wrote reports to: {report_dir}")
-        print(f"[done][FAST] Key files: {mods_csv}, {skeleton_txt}, {routers_csv}, {experts_csv}, {summary_txt}")
+        integrity_status = (integrity_info or {}).get("integrity_status", "UNKNOWN")
+        if integrity_status == "FAIL":
+            reasons = (integrity_info or {}).get("integrity_reasons", [])
+            reason_text = f" ({'; '.join(reasons)})" if reasons else ""
+            logger.error("[fail] Integrity checks failed in FAST mode%s", reason_text)
+            sys.exit(1)
+
+        logger.info("[done][FAST] Wrote reports to: %s", report_dir)
+        logger.info("[done][FAST] Key files: %s, %s, %s, %s, %s", mods_csv, skeleton_txt, routers_csv, experts_csv, summary_txt)
         return
 
     # ------------------ Full mode (real weights) ------------------
@@ -539,7 +594,7 @@ def main():
 
     device_map = "auto" if torch.cuda.is_available() else {"": "cpu"}
 
-    print(f"[info] Loading model '{model_id}' (dtype={dtype}, device_map={device_map}) ...")
+    logger.info("[info] Loading model '%s' (dtype=%s, device_map=%s) ...", model_id, dtype, device_map)
     try:
         # VLM-friendly first try
         model = AutoModel.from_pretrained(
@@ -549,7 +604,7 @@ def main():
             trust_remote_code=True,
         )
     except Exception as e:
-        print(f"[warn] AutoModel load failed ({e}); trying AutoModelForCausalLM ...")
+        logger.warning("[warn] AutoModel load failed (%s); trying AutoModelForCausalLM ...", e)
         model = AutoModelForCausalLM.from_pretrained(
             model_id,
             dtype=dtype,
@@ -634,7 +689,7 @@ def main():
         def log_writer(s: str):
             with open(hook_log, "a") as fh:
                 fh.write(s + "\n")
-            print(s)
+            logger.info(s)
 
         example_routers = [r.name for r in rows if r.is_router][:1]
         example_experts = [r.name for r in rows if r.is_expert][:1]
@@ -664,11 +719,25 @@ def main():
                 integrity_info=integrity_info,
             )
         except Exception as e:
-            print(f"[error] Failed to write JSON outputs: {e}")
-            raise
+            logger.error("[error] Failed to write JSON outputs: %s", e)
+            sys.exit(1)
 
-    print(f"[done] Wrote reports to: {report_dir}")
-    print(f"[done] Key files: {mods_csv}, {skeleton_txt}, {routers_csv}, {experts_csv}, {summary_txt}, validation_report.txt")
+    integrity_status = (integrity_info or {}).get("integrity_status", "UNKNOWN")
+    if integrity_status == "FAIL":
+        reasons = (integrity_info or {}).get("integrity_reasons", [])
+        reason_text = f" ({'; '.join(reasons)})" if reasons else ""
+        logger.error("[fail] Integrity checks failed in FULL mode%s", reason_text)
+        sys.exit(1)
+
+    logger.info("[done] Wrote reports to: %s", report_dir)
+    logger.info(
+        "[done] Key files: %s, %s, %s, %s, %s, validation_report.txt",
+        mods_csv,
+        skeleton_txt,
+        routers_csv,
+        experts_csv,
+        summary_txt,
+    )
 
 
 if __name__ == "__main__":
