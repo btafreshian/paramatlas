@@ -13,7 +13,7 @@ Works directly from a **Hugging Face model id/path** (no server needed) or can *
 - **Safety checks:**
   - Writes **CSV param totals** and (in full mode) compares them to the model’s true parameter count; stamps **INTEGRITY STATUS: PASS/FAIL**.
   - Generates a `validation_report.txt` with **MoE per-group counts** and warnings for incomplete groups.
-- **Outputs you can diff & script:** `skeleton.txt`, `modules.csv`, `routers.csv`, `experts.csv`, `summary.txt`, `validation_report.txt` (+ optional `hook_log.txt`).
+- **Outputs you can diff & script:** `skeleton.txt`, `modules.csv`, `routers.csv`, `experts.csv`, `summary.txt`, `validation_report.txt` (+ optional `hook_log.txt`). Add `--json-output` to mirror the key tables as `summary.json` and `modules.json` for structured tooling.
 
 ---
 
@@ -61,11 +61,15 @@ The report surfaces the nested module layout, per-module parameter counts, MoE r
 
 Each run writes a timestamped folder under `./reports/…` containing:
 
+Enable `--json-output` to add structured mirrors alongside the existing text and CSV artifacts.
+
 | File | What it is |
 |---|---|
 | `summary.txt` | Totals, counts, **INTEGRITY STATUS: PASS/FAIL**. |
+| `summary.json` | (When `--json-output` is set) Compact JSON summary mirroring the key totals, integrity status, and MoE stats. |
 | `skeleton.txt` | Indented module tree (dotted names + class). |
 | `modules.csv` | One row per module: name, class, parent, depth, **param/buffer counts**, router/expert flags, **moe_group**. |
+| `modules.json` | (When `--json-output` is set) JSON array of per-module entries matching the `modules.csv` schema. |
 | `routers.csv` / `experts.csv` | Subsets flagged by the MoE heuristic. |
 | `validation_report.txt` | MoE per-group stats (experts/routers/params), warnings, and (full mode) model vs CSV totals. |
 | `hook_log.txt` | (Full mode + hooks only) one-shot shapes/stats from first router/expert. |
@@ -76,8 +80,10 @@ Each run writes a timestamped folder under `./reports/…` containing:
 ## 📂 Understanding the output files
 
 - `summary.txt` — headline counts, integrity verdict, and any warnings so you can sanity-check runs without opening spreadsheets.
+- `summary.json` — (when `--json-output` is enabled) structured mirror of the summary totals, integrity status, and MoE group stats for quick machine parsing.
 - `skeleton.txt` — the hierarchical module tree with dotted names and classes, ideal for spotting unexpected blocks or missing layers.
 - `modules.csv` — per-module metrics (parameters, buffers, depth, MoE flags) ready for scripting, pivoting, or diffing across runs.
+- `modules.json` — (when `--json-output` is enabled) JSON array of per-module entries matching the CSV schema for downstream tooling.
 - `routers.csv` — filtered view of detected routers, useful when validating MoE routing patterns or comparing load-balancing modules.
 - `experts.csv` — list of MoE experts with group metadata so you can verify multiplicity and parameter allocation.
 - `validation_report.txt` — textual audit of MoE group integrity plus (in full mode) parameter deltas against instantiated weights.
@@ -157,6 +163,7 @@ python audit_vllm_cluster.py --model org/model@<commit_sha> --fast
 ```
 usage: audit_vllm_cluster.py [--endpoint URL] [--model HF_ID_OR_PATH]
                              [--fast] [--no-hooks] [--outdir DIR]
+                             [--json-output]
 
 optional arguments:
   --endpoint URL   vLLM/OpenAI-compatible base URL (uses /v1/models)
@@ -164,6 +171,7 @@ optional arguments:
   --fast           Build skeleton from config (no weights)
   --no-hooks       Disable tiny one-shot hooks (full mode only)
   --outdir DIR     Output directory (default: reports)
+  --json-output    Also emit `summary.json` and `modules.json` alongside the text/CSV reports
 ```
 
 ---
@@ -202,7 +210,7 @@ PY
 
 ## 🔗 Integration hints
 
-ParamAtlas can be scripted from notebooks or CI jobs: invoke `audit_vllm_cluster.py` with the desired `--model` or `--endpoint`, then load `modules.csv`, `routers.csv`, or `experts.csv` into pandas to drive dashboards, regression checks, or automated alerts using the same data schema the CLI produces.
+ParamAtlas can be scripted from notebooks or CI jobs: invoke `audit_vllm_cluster.py` with the desired `--model` or `--endpoint`, then load `modules.csv`, `routers.csv`, or `experts.csv` into pandas to drive dashboards, regression checks, or automated alerts using the same data schema the CLI produces. Prefer `--json-output` when downstream tooling expects structured JSON—`summary.json` and `modules.json` mirror the text/CSV artifacts without additional parsing.
 
 ---
 
@@ -221,4 +229,4 @@ ParamAtlas can be scripted from notebooks or CI jobs: invoke `audit_vllm_cluster
 PRs welcome! Ideas:
 - Family-specific MoE detectors (beyond heuristics).
 - Per-layer param histograms & pruning-candidate suggestions.
-- Optional JSON outputs for downstream tooling.
+- Additional structured export schemas or integrations (build on `--json-output`).

@@ -71,6 +71,8 @@ def parse_args():
     ap.add_argument("--no-hooks", action="store_true", help="Disable tiny one-shot hooks sanity check (full mode only)")
     ap.add_argument("--fast", action="store_true", help="FAST: build skeleton & counts from config with empty weights (no real weight load)")
     ap.add_argument("--outdir", default="reports", help="Directory to create report folder in")
+    ap.add_argument("--json-output", action="store_true",
+                    help="Also emit summary.json and modules.json alongside existing reports")
     return ap.parse_args()
 
 
@@ -112,6 +114,74 @@ class Row:
     is_router: bool
     is_expert: bool
     moe_group: str
+
+
+def write_modules_json(report_dir: str, rows: List[Row]) -> None:
+    """Write modules.json mirroring modules.csv order and columns."""
+    modules_path = os.path.join(report_dir, "modules.json")
+    payload = []
+    for r in rows:
+        payload.append({
+            "name": r.name,
+            "class": r.cls,
+            "parent": r.parent,
+            "depth": r.depth,
+            "n_params": r.n_params,
+            "n_trainable": r.n_trainable,
+            "n_buffers": r.n_buffers,
+            "is_router": bool(r.is_router),
+            "is_expert": bool(r.is_expert),
+            "moe_group": r.moe_group,
+        })
+    with open(modules_path, "w") as f:
+        json.dump(payload, f, indent=2)
+
+
+def write_summary_json(
+    report_dir: str,
+    *,
+    model_id: str,
+    source: Dict[str, str],
+    mode_label: str,
+    integrity_info: dict,
+) -> None:
+    """Write summary.json with compact summary data."""
+    summary_path = os.path.join(report_dir, "summary.json")
+    totals = {
+        "parameters": integrity_info.get("csv_total"),
+    }
+    if integrity_info.get("csv_train") is not None:
+        totals["trainable_parameters"] = integrity_info.get("csv_train")
+
+    moe_groups_payload = []
+    for entry in integrity_info.get("moe_groups", []):
+        moe_groups_payload.append({
+            "name": entry.get("name"),
+            "experts": entry.get("experts"),
+            "routers": entry.get("routers"),
+            "parameters": entry.get("parameters"),
+        })
+
+    payload = {
+        "model_id": model_id,
+        "mode": mode_label,
+        "source": source,
+        "totals": totals,
+        "integrity": {
+            "status": integrity_info.get("integrity_status", "UNKNOWN"),
+            "reasons": integrity_info.get("integrity_reasons", []),
+        },
+        "moe_groups": moe_groups_payload,
+    }
+    if integrity_info.get("model_total") is not None:
+        payload["model_parameter_total"] = integrity_info.get("model_total")
+
+    payload["integrity"]["bad_groups"] = sorted(
+        list(integrity_info.get("bad_groups", {}).keys())
+    )
+
+    with open(summary_path, "w") as f:
+        json.dump(payload, f, indent=2)
 
 MOE_ROUTER_KEYS = ("router", "gate", "gating", "topk", "switch", "score", "routing")
 MOE_EXPERT_KEYS = ("expert", "experts", "ffn_expert", "moe", "sparse", "mixture")
@@ -253,11 +323,24 @@ def write_integrity_and_moe_reports(
         else:
             sf.write("INTEGRITY STATUS    : PASS\n")
 
+    moe_group_entries = [
+        {
+            "name": name,
+            "experts": stats["experts"],
+            "routers": stats["routers"],
+            "parameters": stats["params"],
+        }
+        for name, stats in sorted_groups
+    ]
+
     return {
         "csv_total": sum_csv_params,
         "csv_train": sum_csv_train,
         "bad_groups": bad_groups,
         "model_total": model_params_full,
+        "integrity_status": status,
+        "integrity_reasons": reasons[:],
+        "moe_groups": moe_group_entries,
     }
 
 
@@ -320,6 +403,11 @@ def main():
         model_id = pick_model_id(models_payload)
         if not model_id:
             raise SystemExit("Could not infer a model id from endpoint payload.")
+
+    if args.model:
+        source_info = {"type": "model_argument", "value": args.model}
+    else:
+        source_info = {"type": "endpoint_discovery", "endpoint": args.endpoint}
 
     # Report dir
     ts = dt.datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -416,12 +504,26 @@ def main():
             f.write(f"Reports directory  : {report_dir}\n")
 
         # ---- SAFETY CHECKS (FAST) ----
-        write_integrity_and_moe_reports(
+        integrity_info = write_integrity_and_moe_reports(
             report_dir=report_dir,
             rows=rows,
             mode_label="FAST",
             model_params_full=None,   # no real weights in FAST mode
         )
+
+        if args.json_output:
+            try:
+                write_modules_json(report_dir, rows)
+                write_summary_json(
+                    report_dir,
+                    model_id=model_id,
+                    source=source_info,
+                    mode_label="FAST",
+                    integrity_info=integrity_info,
+                )
+            except Exception as e:
+                print(f"[error] Failed to write JSON outputs: {e}")
+                raise
 
         print(f"[done][FAST] Wrote reports to: {report_dir}")
         print(f"[done][FAST] Key files: {mods_csv}, {skeleton_txt}, {routers_csv}, {experts_csv}, {summary_txt}")
@@ -519,7 +621,7 @@ def main():
 
     # ---- SAFETY CHECKS (FULL) ----
     model_params = sum(p.numel() for p in model.parameters())
-    write_integrity_and_moe_reports(
+    integrity_info = write_integrity_and_moe_reports(
         report_dir=report_dir,
         rows=rows,
         mode_label="FULL",
@@ -550,6 +652,20 @@ def main():
         for h in handles:
             with contextlib.suppress(Exception):
                 h.remove()
+
+    if args.json_output:
+        try:
+            write_modules_json(report_dir, rows)
+            write_summary_json(
+                report_dir,
+                model_id=model_id,
+                source=source_info,
+                mode_label="FULL",
+                integrity_info=integrity_info,
+            )
+        except Exception as e:
+            print(f"[error] Failed to write JSON outputs: {e}")
+            raise
 
     print(f"[done] Wrote reports to: {report_dir}")
     print(f"[done] Key files: {mods_csv}, {skeleton_txt}, {routers_csv}, {experts_csv}, {summary_txt}, validation_report.txt")
