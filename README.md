@@ -97,6 +97,8 @@ Enable `--json-output` to add structured mirrors alongside the existing text and
 - **Use FAST** when you need **structure now** and don’t want to load huge weights. It requires only `config.json` (+ small remote code files if `trust_remote_code`).
 - **Use FULL** when you want enumeration based on **real instantiated modules** (and optional 1-shot hooks for CausalLMs). For VLMs, prefer `--no-hooks`.
 
+Pick FAST with `--mode fast` or FULL with `--mode full`; the legacy `--fast` flag still flips FAST mode whenever `--mode` is omitted.
+
 ---
 
 ## ✅ Integrity & Validation
@@ -162,17 +164,25 @@ python audit_vllm_cluster.py --model org/model@<commit_sha> --fast
 
 ```
 usage: audit_vllm_cluster.py [--endpoint URL] [--model HF_ID_OR_PATH]
-                             [--fast] [--no-hooks] [--outdir DIR]
+                             [--mode {fast,full}] [--fast]
+                             [--verbosity {quiet,normal,verbose}]
+                             [--no-hooks] [--outdir DIR]
                              [--json-output]
 
 optional arguments:
   --endpoint URL   vLLM/OpenAI-compatible base URL (uses /v1/models)
   --model ID|PATH  HF model id or local path (skips endpoint discovery)
+  --mode {fast,full}
+                   Select fast (empty weights) or full (load weights) run mode
   --fast           Build skeleton from config (no weights)
+  --verbosity {quiet,normal,verbose}
+                   Control logging output level (default: normal)
   --no-hooks       Disable tiny one-shot hooks (full mode only)
   --outdir DIR     Output directory (default: reports)
   --json-output    Also emit `summary.json` and `modules.json` alongside the text/CSV reports
 ```
+
+> `--mode` is preferred for selecting FAST or FULL. When `--mode` is omitted, the legacy `--fast` flag continues to toggle FAST mode for backward compatibility.
 
 ---
 
