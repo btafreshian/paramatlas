@@ -12,12 +12,17 @@ import os
 import re
 import sys
 from dataclasses import dataclass
-from typing import Any, Dict, Iterable, List, Optional, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Set, Tuple
 
 import requests
 import torch
 from torch import nn
 from transformers import AutoConfig, AutoModel, AutoModelForCausalLM, AutoTokenizer
+
+try:  # AutoModelForImageTextToText was introduced in newer transformers releases
+    from transformers import AutoModelForImageTextToText
+except Exception:  # pragma: no cover - older transformers do not expose this auto class
+    AutoModelForImageTextToText = None  # type: ignore
 from transformers.utils import is_torch_bf16_gpu_available
 
 # accelerate is only needed for --fast
@@ -252,6 +257,63 @@ MOE_EXPERT_CLASS_HINTS = (
 )
 
 
+def _normalized_architectures(cfg: Optional[AutoConfig]) -> List[str]:
+    """Return lowercase architecture names from a config, if any."""
+
+    if cfg is None:
+        return []
+    arch_list = getattr(cfg, "architectures", None) or []
+    return [arch.lower() for arch in arch_list]
+
+
+def _is_vision_language_config(cfg: Optional[AutoConfig]) -> bool:
+    """Detect configs that describe VLM / image-text models."""
+
+    if cfg is None:
+        return False
+    if getattr(cfg, "vision_config", None):
+        return True
+    model_type = (getattr(cfg, "model_type", "") or "").lower()
+    if any(key in model_type for key in ("vision", "vl", "imagetext", "multimodal")):
+        return True
+    archs = _normalized_architectures(cfg)
+    return any(
+        any(key in arch for key in ("vision", "vl", "image", "imagetext"))
+        for arch in archs
+    )
+
+
+def _has_causal_generation_head(cfg: Optional[AutoConfig]) -> bool:
+    """Detect configs whose recommended classes expose a generation head."""
+
+    if cfg is None:
+        return False
+    archs = _normalized_architectures(cfg)
+    return any(
+        any(token in arch for token in ("conditionalgeneration", "causallm"))
+        for arch in archs
+    )
+
+
+def preferred_model_loaders(cfg: Optional[AutoConfig]) -> List[Any]:
+    """Return the ordered list of AutoModel classes to try for a given config."""
+
+    loaders: List[Any] = []
+    if _is_vision_language_config(cfg) and AutoModelForImageTextToText is not None:
+        loaders.append(AutoModelForImageTextToText)
+    if _has_causal_generation_head(cfg):
+        loaders.append(AutoModelForCausalLM)
+    # AutoModel remains the universal fallback and should always be tried.
+    loaders.append(AutoModel)
+
+    # Remove duplicates while preserving order.
+    deduped: List[Any] = []
+    for loader in loaders:
+        if loader not in deduped:
+            deduped.append(loader)
+    return deduped
+
+
 def format_int(value: int) -> str:
     """Return a human-friendly formatted integer."""
 
@@ -292,13 +354,50 @@ def guess_is_expert(name: str, cls: str) -> bool:
     return False
 
 
-def nearest_moe_group(name: str, class_chain: Dict[str, str]) -> str:
+def detect_structural_moe_groups(
+    named_modules: Iterable[Tuple[str, nn.Module]],
+    class_chain: Dict[str, str],
+) -> Set[str]:
+    """Infer parent blocks that own both routers and experts."""
+
+    children_by_parent: Dict[str, List[str]] = {}
+    for name, _ in named_modules:
+        parent = get_parent(name)
+        if not parent:
+            continue
+        children_by_parent.setdefault(parent, []).append(name)
+
+    structural_groups: Set[str] = set()
+    for parent, children in children_by_parent.items():
+        has_router_child = any(
+            guess_is_router(child, class_chain.get(child, "")) for child in children
+        )
+        has_expert_child = any(
+            guess_is_expert(child, class_chain.get(child, "")) for child in children
+        )
+        if has_router_child and has_expert_child:
+            # Qwen-style VL MoE blocks place routers and experts under siblings
+            # (e.g., layers.N.mlp.gate + layers.N.mlp.experts). Treating their
+            # shared parent as the moe_group keeps the structure intact.
+            structural_groups.add(parent)
+    return structural_groups
+
+
+def nearest_moe_group(
+    name: str, class_chain: Dict[str, str], structural_moe_groups: Set[str]
+) -> str:
     """Return the nearest ancestor considered an MoE group."""
 
     parent = get_parent(name)
     while parent:
         cls = class_chain.get(parent, "")
-        if guess_is_expert(parent, cls) or "Moe" in cls or "MoE" in cls or "Sparse" in cls:
+        if (
+            parent in structural_moe_groups
+            or guess_is_expert(parent, cls)
+            or "Moe" in cls
+            or "MoE" in cls
+            or "Sparse" in cls
+        ):
             return parent
         parent = get_parent(parent)
     return ""
@@ -335,6 +434,7 @@ def build_rows(
     rows: List[Row] = []
     total_params = 0
     total_train = 0
+    structural_moe_groups = detect_structural_moe_groups(named_modules, class_chain)
     for name, module in named_modules:
         cls = module.__class__.__name__
         parent = get_parent(name)
@@ -348,7 +448,7 @@ def build_rows(
         total_train += n_trainable
         is_router = guess_is_router(name, cls)
         is_expert = guess_is_expert(name, cls)
-        moe_group = nearest_moe_group(name, class_chain)
+        moe_group = nearest_moe_group(name, class_chain, structural_moe_groups)
         rows.append(
             Row(
                 name=name,
@@ -697,13 +797,31 @@ def run_fast_mode(
 
     logger.info("[info] FAST mode: building skeleton with empty weights (no real weight loading)")
     with init_empty_weights():
-        try:
+        tmp_model = None
+        last_exc: Optional[Exception] = None
+        loader_chain = preferred_model_loaders(cfg)
+        for loader in loader_chain:
+            loader_name = getattr(loader, "__name__", str(loader))
             try:
-                tmp_model = AutoModelForCausalLM.from_config(cfg, trust_remote_code=True)
-            except Exception:
-                tmp_model = AutoModel.from_config(cfg, trust_remote_code=True)
-        except Exception as exc:
-            logger.error("[error] Failed to instantiate model from config: %s", exc)
+                tmp_model = loader.from_config(cfg, trust_remote_code=True)
+                logger.debug(
+                    "FAST mode instantiated skeleton with %s", loader_name
+                )
+                break
+            except Exception as exc:  # pragma: no cover - defensive fallback
+                last_exc = exc
+                logger.warning(
+                    "[warn] %s.from_config failed (%s); trying next candidate ...",
+                    loader_name,
+                    exc,
+                )
+        if tmp_model is None:
+            logger.error(
+                "[error] Failed to instantiate model from config after trying %s",
+                ", ".join(getattr(ld, "__name__", str(ld)) for ld in loader_chain),
+            )
+            if last_exc:
+                raise last_exc
             sys.exit(1)
 
     named_modules = list(tmp_model.named_modules())
@@ -762,6 +880,7 @@ def run_full_mode(
     source_info: Dict[str, str],
     json_output: bool,
     no_hooks: bool,
+    cfg: Optional[AutoConfig],
 ) -> Dict[str, Any]:
     """Execute FULL mode by loading real model weights."""
 
@@ -778,25 +897,42 @@ def run_full_mode(
     else:
         device_map = {"": "cpu"}
 
-    logger.info("[info] Loading model '%s' (dtype=%s, device_map=%s) ...", model_id, dtype, device_map)
-    try:
-        model = AutoModel.from_pretrained(
+    logger.info(
+        "[info] Loading model '%s' (dtype=%s, device_map=%s) ...",
+        model_id,
+        dtype,
+        device_map,
+    )
+    model = None
+    last_exc: Optional[Exception] = None
+    loader_chain = preferred_model_loaders(cfg)
+    for loader in loader_chain:
+        loader_name = getattr(loader, "__name__", str(loader))
+        try:
+            model = loader.from_pretrained(
+                model_id,
+                dtype=dtype,
+                device_map=device_map,
+                trust_remote_code=True,
+            )
+            logger.info("[info] Loaded weights with %s", loader_name)
+            break
+        except Exception as exc:  # pragma: no cover - defensive fallback
+            last_exc = exc
+            logger.warning(
+                "[warn] %s.from_pretrained failed (%s); trying next candidate ...",
+                loader_name,
+                exc,
+            )
+    if model is None:
+        logger.error(
+            "[error] Failed to load model '%s' after trying %s",
             model_id,
-            dtype=dtype,
-            device_map=device_map,
-            trust_remote_code=True,
+            ", ".join(getattr(ld, "__name__", str(ld)) for ld in loader_chain),
         )
-    except Exception as exc:
-        logger.warning(
-            "[warn] AutoModel load failed (%s); trying AutoModelForCausalLM ...",
-            exc,
-        )
-        model = AutoModelForCausalLM.from_pretrained(
-            model_id,
-            dtype=dtype,
-            device_map=device_map,
-            trust_remote_code=True,
-        )
+        if last_exc:
+            raise last_exc
+        sys.exit(1)
     model.eval()
 
     named_modules = list(model.named_modules())
@@ -979,6 +1115,7 @@ def main() -> None:
         source_info=source_info,
         json_output=args.json_output,
         no_hooks=args.no_hooks,
+        cfg=cfg,
     )
     handle_integrity_failure("FULL", integrity_info)
 
